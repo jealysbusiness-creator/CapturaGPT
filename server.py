@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -18,6 +19,7 @@ from PIL import Image, UnidentifiedImageError
 load_dotenv(Path(__file__).with_name(".env"))
 
 app = FastAPI(title="Servidor proxy de análisis", docs_url=None, redoc_url=None)
+logger = logging.getLogger("capturagpt")
 MAX_UPLOAD_BYTES = 8 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 20_000_000
 
@@ -180,5 +182,12 @@ def analyze(
         result = parse_structured_answer(response.output_text)
     except Exception as exc:
         # No se devuelve el detalle del proveedor ni secretos al cliente.
+        logger.error(
+            "Analysis failed after debit: type=%s status=%s code=%s detail=%s",
+            type(exc).__name__,
+            getattr(exc, "status_code", None),
+            getattr(exc, "code", None),
+            str(exc) if isinstance(exc, ValueError) else "hidden",
+        )
         raise HTTPException(502, {"error": "ANALYSIS_FAILED", "credits_left": credits_left}) from exc
     return {"result": result, "credits_left": credits_left}
