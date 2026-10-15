@@ -6,3 +6,5 @@ supabase==2.32.0
 python-dotenv==1.2.4
 requests==2.34.2
 Pillow==12.3.0
+
+PyJWT[crypto]>=2.12.0
