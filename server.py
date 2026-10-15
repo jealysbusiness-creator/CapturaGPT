@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import base64
-import io
 import hashlib
 import hmac
-import time
-import jwt
+import io
 import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
+import jwt
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -98,24 +98,67 @@ def prepare_image(upload: UploadFile) -> str:
 
 def verify_password(password: str, stored: str) -> bool:
     try:
-        _, n, r, pp, salt_b64, digest_b64 = stored.split("$")
-        salt=base64.urlsafe_b64decode(salt_b64); expected=base64.urlsafe_b64decode(digest_b64)
-        actual=hashlib.scrypt(password.encode(),salt=salt,n=int(n),r=int(r),p=int(pp),dklen=len(expected))
-        return hmac.compare_digest(actual,expected)
-    except (ValueError,TypeError): return False
+        algorithm, n, r, p, salt_b64, digest_b64 = stored.split("$")
+        if (algorithm, n, r, p) != ("scrypt", "16384", "8", "1"):
+            return False
+        salt = base64.urlsafe_b64decode(salt_b64)
+        expected = base64.urlsafe_b64decode(digest_b64)
+        actual = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=len(expected))
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
 
-def supabase_rest(table: str, **kwargs):
-    url=required_env("SUPABASE_URL").rstrip("/"); key=required_env("SUPABASE_SERVICE_ROLE_KEY")
-    return requests.get(f"{url}/rest/v1/{table}",headers={"apikey":key,"Authorization":f"Bearer {key}"},timeout=(5,15),**kwargs)
+
+def supabase_headers() -> dict[str, str]:
+    key = required_env("SUPABASE_SERVICE_ROLE_KEY")
+    return {"apikey": key, "Authorization": f"Bearer {key}"}
+
+
+def bind_account_device(username: str, hardware_id: str) -> int:
+    url = required_env("SUPABASE_URL").rstrip("/")
+    try:
+        response = requests.post(
+            f"{url}/rest/v1/rpc/bind_account_device",
+            headers=supabase_headers(),
+            json={"p_username": username, "p_hardware_id": hardware_id},
+            timeout=(5, 15),
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Account hardware binding failed: %s", type(exc).__name__)
+        raise HTTPException(503, "No se pudo validar el equipo.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(503, "Respuesta inválida de cuentas.")
+    if data.get("ok") is not True:
+        raise HTTPException(403, data.get("error", "INVALID_CREDENTIALS"))
+    credits = data.get("credits_left")
+    if type(credits) is not int or credits < 0:
+        raise HTTPException(503, "Respuesta inválida de cuentas.")
+    return credits
 
 def consume_account_credit(username: str, hardware: str) -> int:
-    url=required_env("SUPABASE_URL").rstrip("/"); key=required_env("SUPABASE_SERVICE_ROLE_KEY")
+    url = required_env("SUPABASE_URL").rstrip("/")
     try:
-        r=requests.post(f"{url}/rest/v1/rpc/consume_account_credit",headers={"apikey":key,"Authorization":f"Bearer {key}"},json={"p_username":username,"p_hardware_id":hardware},timeout=(5,15)); r.raise_for_status(); data=r.json()
-    except (requests.RequestException,ValueError) as exc: raise HTTPException(503,"No se pudo validar la cuenta.") from exc
+        r = requests.post(
+            f"{url}/rest/v1/rpc/consume_account_credit",
+            headers=supabase_headers(),
+            json={"p_username": username, "p_hardware_id": hardware},
+            timeout=(5, 15),
+        )
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(503, "No se pudo validar la cuenta.") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(503, "Respuesta inválida de cuentas.")
     if data.get("ok") is not True:
-        code=data.get("error","INVALID_CREDENTIALS"); raise HTTPException(402 if code=="INSUFFICIENT_CREDITS" else 403,code)
-    return data["credits_left"]
+        code = data.get("error", "INVALID_CREDENTIALS")
+        raise HTTPException(402 if code == "INSUFFICIENT_CREDITS" else 403, code)
+    credits = data.get("credits_left")
+    if type(credits) is not int or credits < 0:
+        raise HTTPException(503, "Respuesta inválida de cuentas.")
+    return credits
 
 def consume_credit(license_key: str, hardware_id: str) -> int:
     url = required_env("SUPABASE_URL").rstrip("/")
@@ -170,25 +213,56 @@ def parse_structured_answer(output_text: str) -> str:
 
 @app.post("/api/v1/auth/login")
 def login(username: str = Form(...), password: str = Form(...), hardware_id: str = Form(...)):
-    username=username.strip(); hardware_id=hardware_id.strip()
-    if not username or len(password)<8 or not re.fullmatch(r"[0-9a-f]{64}",hardware_id): raise HTTPException(403,"INVALID_CREDENTIALS")
+    username = username.strip()
+    hardware_id = hardware_id.strip()
+    if (
+        not re.fullmatch(r"[A-Za-z0-9_.-]{3,64}", username)
+        or not 8 <= len(password) <= 256
+        or not re.fullmatch(r"[0-9a-f]{64}", hardware_id)
+    ):
+        raise HTTPException(401, "INVALID_CREDENTIALS")
     try:
-        r=supabase_rest("accounts", params={"username":f"eq.{username}","select":"username,password_hash,is_active,hardware_id,credits_remaining"}); r.raise_for_status(); rows=r.json()
-    except (requests.RequestException, ValueError) as exc: raise HTTPException(503,"No se pudo conectar con cuentas.") from exc
-    if not rows or not rows[0].get("is_active") or not verify_password(password,rows[0].get("password_hash","")): raise HTTPException(401,"INVALID_CREDENTIALS")
-    bound=rows[0].get("hardware_id")
-    if bound and bound != hardware_id: raise HTTPException(403,"DEVICE_MISMATCH")
-    if not bound:
-        key=required_env("SUPABASE_SERVICE_ROLE_KEY"); base=required_env("SUPABASE_URL").rstrip("/")
-        requests.patch(base+"/rest/v1/accounts",headers={"apikey":key,"Authorization":f"Bearer {key}","Content-Type":"application/json","Prefer":"return=minimal"},params={"username":f"eq.{username}"},json={"hardware_id":hardware_id,"last_login_at":"now()"},timeout=(5,15)).raise_for_status()
-    token=jwt.encode({"sub":username,"hardware_id":hardware_id,"exp":int(time.time())+43200},required_env("AUTH_TOKEN_SECRET"),algorithm="HS256")
-    return {"access_token":token,"token_type":"bearer","credits_left":rows[0].get("credits_remaining",0)}
+        signing_key = required_env("AUTH_TOKEN_SECRET")
+    except RuntimeError:
+        logger.error("AUTH_TOKEN_SECRET is missing")
+        raise HTTPException(503, "Servidor de autenticación sin configurar.") from None
+    try:
+        r = requests.get(
+            f"{required_env('SUPABASE_URL').rstrip('/')}/rest/v1/accounts",
+            headers=supabase_headers(),
+            params={"username": f"eq.{username}", "select": "password_hash,is_active"},
+            timeout=(5, 15),
+        )
+        r.raise_for_status()
+        rows = r.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise HTTPException(503, "No se pudo conectar con cuentas.") from exc
+    if not isinstance(rows, list) or not rows or not rows[0].get("is_active"):
+        raise HTTPException(401, "INVALID_CREDENTIALS")
+    if not verify_password(password, rows[0].get("password_hash", "")):
+        raise HTTPException(401, "INVALID_CREDENTIALS")
+    credits_left = bind_account_device(username, hardware_id)
+    token = jwt.encode(
+        {"sub": username, "hardware_id": hardware_id, "exp": int(time.time()) + 43200},
+        signing_key,
+        algorithm="HS256",
+    )
+    return {"access_token": token, "token_type": "bearer", "credits_left": credits_left}
 
 def authenticated_user(authorization: str):
-    if not authorization.lower().startswith("bearer "): raise HTTPException(401,"AUTH_REQUIRED")
+    if not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "AUTH_REQUIRED")
     try:
-        d=jwt.decode(authorization[7:].strip(),required_env("AUTH_TOKEN_SECRET"),algorithms=["HS256"]); return str(d["sub"]),str(d["hardware_id"])
-    except Exception as exc: raise HTTPException(401,"INVALID_SESSION") from exc
+        data = jwt.decode(
+            authorization[7:].strip(), required_env("AUTH_TOKEN_SECRET"), algorithms=["HS256"]
+        )
+        username = str(data["sub"])
+        hardware_id = str(data["hardware_id"])
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,64}", username) or not re.fullmatch(r"[0-9a-f]{64}", hardware_id):
+            raise ValueError("Invalid token claims")
+        return username, hardware_id
+    except Exception as exc:
+        raise HTTPException(401, "INVALID_SESSION") from exc
 
 @app.get("/health")
 def health() -> dict[str, str]:

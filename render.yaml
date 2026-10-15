@@ -13,5 +13,7 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
+      - key: AUTH_TOKEN_SECRET
+        sync: false
       - key: OPENAI_MODEL
         value: gpt-4o
